@@ -172,6 +172,18 @@ _dbPath() {
 		fi
 	fi
 
+	if [ -z "$dbPath" ]; then
+		if _mongod_hack_have_arg --configsvr "$@" || {
+			_parse_config "$@" \
+			&& clusterRole="$(jq -r '.sharding.clusterRole // empty' "$jsonConfigFile")" \
+			&& [ "$clusterRole" = 'configsvr' ]
+		}; then
+			# if running as config server, then the default dbpath is /data/configdb
+			# https://docs.mongodb.com/manual/reference/program/mongod/#cmdoption-mongod-configsvr
+			dbPath=/data/configdb
+		fi
+	fi
+
 	: "${dbPath:=/data/db}"
 
 	echo "$dbPath"
@@ -241,8 +253,19 @@ if [ "$originalArgOne" = 'mongod' ]; then
 			_mongod_hack_ensure_no_arg_val --replSet "${mongodHackedArgs[@]}"
 		fi
 
-		sslMode="$(_mongod_hack_have_arg '--sslPEMKeyFile' "$@" && echo 'allowSSL' || echo 'disabled')" # "BadValue: need sslPEMKeyFile when SSL is enabled" vs "BadValue: need to enable SSL via the sslMode flag when using SSL configuration parameters"
-		_mongod_hack_ensure_arg_val --sslMode "$sslMode" "${mongodHackedArgs[@]}"
+		# "BadValue: need sslPEMKeyFile when SSL is enabled" vs "BadValue: need to enable SSL via the sslMode flag when using SSL configuration parameters"
+		tlsMode='disabled'
+		if _mongod_hack_have_arg '--tlsCertificateKeyFile' "$@"; then
+			tlsMode='allowTLS'
+		elif _mongod_hack_have_arg '--sslPEMKeyFile' "$@"; then
+			tlsMode='allowSSL'
+		fi
+		# 4.2 switched all configuration/flag names from "SSL" to "TLS"
+		if [ "$tlsMode" = 'allowTLS' ] || mongod --help 2>&1 | grep -q -- ' --tlsMode '; then
+			_mongod_hack_ensure_arg_val --tlsMode "$tlsMode" "${mongodHackedArgs[@]}"
+		else
+			_mongod_hack_ensure_arg_val --sslMode "$tlsMode" "${mongodHackedArgs[@]}"
+		fi
 
 		if stat "/proc/$$/fd/1" > /dev/null && [ -w "/proc/$$/fd/1" ]; then
 			# https://github.com/mongodb/mongo/blob/38c0eb538d0fd390c6cb9ce9ae9894153f6e8ef5/src/mongo/db/initialize_server_global_state.cpp#L237-L251
@@ -321,17 +344,15 @@ if [ "$originalArgOne" = 'mongod' ]; then
 	fi
 
 	# MongoDB 3.6+ defaults to localhost-only binding
-	if mongod --help 2>&1 | grep -q -- --bind_ip_all; then # TODO remove this conditional when 3.4 is no longer supported
-		haveBindIp=
-		if _mongod_hack_have_arg --bind_ip "$@" || _mongod_hack_have_arg --bind_ip_all "$@"; then
-			haveBindIp=1
-		elif _parse_config "$@" && jq --exit-status '.net.bindIp // .net.bindIpAll' "$jsonConfigFile" > /dev/null; then
-			haveBindIp=1
-		fi
-		if [ -z "$haveBindIp" ]; then
-			# so if no "--bind_ip" is specified, let's add "--bind_ip_all"
-			set -- "$@" --bind_ip_all
-		fi
+	haveBindIp=
+	if _mongod_hack_have_arg --bind_ip "$@" || _mongod_hack_have_arg --bind_ip_all "$@"; then
+		haveBindIp=1
+	elif _parse_config "$@" && jq --exit-status '.net.bindIp // .net.bindIpAll' "$jsonConfigFile" > /dev/null; then
+		haveBindIp=1
+	fi
+	if [ -z "$haveBindIp" ]; then
+		# so if no "--bind_ip" is specified, let's add "--bind_ip_all"
+		set -- "$@" --bind_ip_all
 	fi
 
 	unset "${!MONGO_INITDB_@}"
